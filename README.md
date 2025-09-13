@@ -1,2 +1,2 @@
 # paper-replications
-The space where I try to replicate results from research papers. 
+This repo is intended to collect various research papers I am replicating on my own machine.
