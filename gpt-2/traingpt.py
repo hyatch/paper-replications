@@ -12,6 +12,7 @@ class CausalSelfAttention(nn.Module):
         
         self.c_attn = nn.Linear(config.n_embd, 3*config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -44,6 +45,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, config.n_embd*4)
         self.gelu = nn.GELU(approximate = 'tanh')
         self.c_proj = nn.Linear(config.n_embd*4, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self,x):
         x = self.c_fc(x) # maps up
@@ -85,7 +87,23 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias = False)  # output layer to softmax tokens
     
-    def forward(self, idx):
+        #weight sharing tech
+        self.transformer.wte.weight = self.lm_head.weight
+        
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean = 0.0, std = std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean = 0.0, std = 0.02)
+    
+    def forward(self, idx, targets=None):
         B, T = idx.size() # gives us the batch and position in the context window this token is
         
         assert T <= self.config.block_size, f"Cannot forward sequence of this size"
@@ -98,6 +116,82 @@ class GPT(nn.Module):
             x = layer(x)
         x = self.transformer.ln_f(x) # final layer norm
         logits = self.lm_head(x) # (B, T, vocab_size)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) #reshape to fit cross_entropy input needs
         
-        return logits
         
+        return logits, loss
+        
+  
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+print("using "+device)
+
+import tiktoken
+
+class DataLoaderLite: 
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+        with open("input.txt", "r", encoding = "utf-8") as f:  
+            text = f.read()
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens, dtype = torch.long)
+        print(f"loaded {self.tokens.size(0)} tokens")
+        print("1 epoch = "+str(self.tokens.size(0)//(B*T))+" batches")
+    
+        self.current_position = 0
+    
+    def next_batch(self):
+        chunk = self.tokens[self.current_position:self.current_position + self.B * self.T + 1]
+        x = chunk[:-1].view(self.B, self.T)
+        y = chunk[1:].view(self.B, self.T)
+        self.current_position += self.B * self.T
+        if self.current_position + (self.B * self.T + 1) >= self.tokens.size(0):
+            self.current_position = 0
+        return x, y
+    
+    
+# can alternatively load Hugging Face weights for GPT-2 from the transformers library
+model = GPT(GPTConfig())
+model.to(device)
+train_loader = DataLoaderLite(B=4, T=32)
+
+
+
+optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    model.train()
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i} loss {loss.item()}")
+
+
+import sys; sys.exit(0)
+
+model.eval()
+max_length = 30
+num_return_sequences = 5
+
+while x.size(1) < max_length:
+    with torch.no_grad():
+        logits = model(x)
+        logits = logits[:, -1, :]
+        probs = F.softmax(logits, dim = -1)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim = -1)
+        ix = torch.multinomial(topk_probs, 1)
+        xcol = torch.gather(topk_indices, -1, ix)
+        x = torch.cat((x, xcol), dim = 1)
+
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">" + decoded)
+    
