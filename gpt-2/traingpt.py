@@ -4,19 +4,22 @@ from dataclasses import dataclass
 import torch.nn.functional as F
 import math
 
-
+# attention block with QKV and masking to prevent looking into the future
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         
+        # for QKV projections for all heads, we 3x our embedding
         self.c_attn = nn.Linear(config.n_embd, 3*config.n_embd)
+        
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
         
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        
+
+        # causal mask to ensure that attention is only applied to the left in the input sequence
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
         
     def forward(self, x):
@@ -28,13 +31,19 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # B, n_head, T, C -> n_head is like a second batch dimension!
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         
-        #apply attention formula
+        # apply attention formula
         att = (q @ k.transpose(-2,-1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf")) # masks out the future tokens with -inf
-        att = F.softmax(att, dim = -1) # softmax over the channels to get probabilities and zero out future
         
+        # apply the mask
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf")) # masks out the future tokens with -inf
+        
+        att = F.softmax(att, dim = -1) # softmax over the channels to get probabilities and zero out future
+
+        # use the value vector for output
         y = att @ v
         y = y.transpose(1,2).contiguous().view(B,T,C) # return to initial shape
+        
+        # output projection
         y = self.c_proj(y)
         
         return y
@@ -48,9 +57,9 @@ class MLP(nn.Module):
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self,x):
-        x = self.c_fc(x) # maps up
+        x = self.c_fc(x) # maps up 4x
         x = self.gelu(x) # approximate gelu activation
-        x= self.c_proj(x) # maps down
+        x= self.c_proj(x) # maps down 4x
         return x
 
 class Block(nn.Module):
@@ -62,7 +71,7 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x)) # residual connections
+        x = x + self.attn(self.ln_1(x)) # residual connections with layer norm
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -87,11 +96,15 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias = False)  # output layer to softmax tokens
     
-        #weight sharing tech
+        # weight sharing tech that reduces total parameters
         self.transformer.wte.weight = self.lm_head.weight
         
+        # initializes weights
         self.apply(self._init_weights)
-        
+
+
+    # basically we initial our weights according to a normal distribution with std 0.02, but if the layer has the NANOGPT_SCALE_INIT attribute (which is set for certain layers above), we scale it down by sqrt(2*num_layers)
+    # this is supposed to help with training stability in deep transformers as proposed in the GPT-2 paper
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             std = 0.02
@@ -123,7 +136,7 @@ class GPT(nn.Module):
         
         return logits, loss
         
-  
+# access the gpu
 device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
@@ -131,13 +144,14 @@ print("using "+device)
 
 import tiktoken
 
+# loads data from Tiny Shakespeare dataset
 class DataLoaderLite: 
     def __init__(self, B, T):
-        self.B = B
-        self.T = T
+        self.B = B # batch size
+        self.T = T # context window size
         with open("input.txt", "r", encoding = "utf-8") as f:  
             text = f.read()
-        enc = tiktoken.get_encoding("gpt2")
+        enc = tiktoken.get_encoding("gpt2") # gets the GPT-2 BPE tokenizer
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens, dtype = torch.long)
         print(f"loaded {self.tokens.size(0)} tokens")
@@ -147,27 +161,38 @@ class DataLoaderLite:
     
     def next_batch(self):
         chunk = self.tokens[self.current_position:self.current_position + self.B * self.T + 1]
-        x = chunk[:-1].view(self.B, self.T)
-        y = chunk[1:].view(self.B, self.T)
-        self.current_position += self.B * self.T
+        x = chunk[:-1].view(self.B, self.T) # input is all but last token
+        y = chunk[1:].view(self.B, self.T)  # target is the next token for all tokens in x
+        
+        self.current_position += self.B * self.T # move forward in the data by B*T tokens
+        
         if self.current_position + (self.B * self.T + 1) >= self.tokens.size(0):
-            self.current_position = 0
+            self.current_position = 0 # if we reach the end of the data, start over
         return x, y
     
     
 # can alternatively load Hugging Face weights for GPT-2 from the transformers library
 model = GPT(GPTConfig())
 model.to(device)
-train_loader = DataLoaderLite(B=4, T=32)
+# model = torch.compile(model) # should be used for faster training in PyTorch 2.0 but my GPU is too old
+
+train_loader = DataLoaderLite(B=8, T=64) # should be B = 8, T = 1024, but my GPU is too small
 
 
+# sets the matmul from FP32 to TF32 for faster training on modern GPUs (i dont have one so i cant test it)
+# reduces the mantissa bits from 23 to 10, so it is less precise but faster
+# torch.set_float_32_matmul_precision('high')
 
+# bugfixed AdamW optimizer from PyTorch
 optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4)
+# sets to training mode
+model.train()
 for i in range(50):
+    # loads a batch from the dataset
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
-    model.train()
     optimizer.zero_grad()
+    #with torch.autocast(device_type=device, dtype=torch.bfloat16): # reduces the precision of certain matmuls and convolutions to BF16 from FP32 for faster training on modern GPUs (i dont have one so i cant test it)
     logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
@@ -176,6 +201,7 @@ for i in range(50):
 
 import sys; sys.exit(0)
 
+# set to eval mode for inference
 model.eval()
 max_length = 30
 num_return_sequences = 5
