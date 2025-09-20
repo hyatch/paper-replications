@@ -41,6 +41,11 @@ class CausalSelfAttention(nn.Module):
 
         # use the value vector for output
         y = att @ v
+        
+        #FlashAttention
+        # y = F.scaled_dot_product_attention(q, k, v, iscausal=True)
+        # Basically allows us to more efficietly compute attention because we don't have to store the entire NxN matrix. We can calculate softmax in tiles that break up the context. 
+        
         y = y.transpose(1,2).contiguous().view(B,T,C) # return to initial shape
         
         # output projection
@@ -77,8 +82,8 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size = 1024 # context length
-    vocab_size = 50257 # 50,000 BPE + 256 basic bytes + <|endoftoken|>
+    block_size: int = 1024 # context length
+    vocab_size: int = 50257 # 50,000 BPE + 256 basic bytes + <|endoftoken|>
     n_layer: int = 12 # number of blocks i guess
     n_head: int = 12 # number of attention heads
     n_embd: int = 768 # embedding dimension
@@ -135,6 +140,32 @@ class GPT(nn.Module):
         
         
         return logits, loss
+    
+    def configure_optimizer(self, weight_decay, learning_rate, device):
+        # loads all the parameters 
+        parameters = {pn: p for pn, p in self.named_parameters()}
+        # loads all the parameters that require gradients
+        parameters = {pn:p for pn, p in parameters.items() if p.requires_grad}
+        
+        # separate out all the parameters that will and wont be decayed
+        decay_params = [p for n, p in parameters.items() if p.ndim >= 2]
+        # these are the parameters that will not be decayed (typically biases and layernorm weights)
+        nodecay_params = [p for n, p in parameters.items() if p.ndim < 2]
+        
+        # sets the weight decay for our two groups
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0},
+        ]
+        
+        # checks for a faster fused kernel in PyTorch's AdamW implementation
+        import inspect
+        fused_avail = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_avail and "cuda" in device
+        
+        # creates the desired AdamW optimizer with proper weight decay and fused kernel if possible
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
         
 # access the gpu
 device = "cpu"
@@ -172,9 +203,27 @@ class DataLoaderLite:
     
     
 # can alternatively load Hugging Face weights for GPT-2 from the transformers library
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size = 50304)) # nicely divisble by powers of 2 which quickens the run time on GPU kernels
 model.to(device)
 # model = torch.compile(model) # should be used for faster training in PyTorch 2.0 but my GPU is too old
+
+# implements the learning rate schedule from the GPT-2 paper
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_iters = 10
+max_iters = 50
+def get_lr(it):
+    if it < warmup_iters:
+        return max_lr * it / warmup_iters # linear warmup
+    if it > max_iters:
+        return min_lr # reached the minimum lr after reading enough tokens from multiple iterations
+    
+    decay_ratio = (it - warmup_iters) / (max_iters - warmup_iters)
+    assert 0.0 <= decay_ratio <= 1.0
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # cosine decay
+    return min_lr + coeff * (max_lr - min_lr)
+
+
 
 train_loader = DataLoaderLite(B=8, T=64) # should be B = 8, T = 1024, but my GPU is too small
 
@@ -184,7 +233,7 @@ train_loader = DataLoaderLite(B=8, T=64) # should be B = 8, T = 1024, but my GPU
 # torch.set_float_32_matmul_precision('high')
 
 # bugfixed AdamW optimizer from PyTorch
-optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4)
+optimizer = model.configure_optimizer(weight_decay=1e-1, learning_rate=max_lr, device=device)
 # sets to training mode
 model.train()
 for i in range(50):
@@ -195,8 +244,9 @@ for i in range(50):
     #with torch.autocast(device_type=device, dtype=torch.bfloat16): # reduces the precision of certain matmuls and convolutions to BF16 from FP32 for faster training on modern GPUs (i dont have one so i cant test it)
     logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # gradient clipping at 1.0 to prevent gradient explosions
     optimizer.step()
-    print(f"step {i} loss {loss.item()}")
+    print(f"step {i} | loss {loss.item()} | norm {norm:.4f}")
 
 
 import sys; sys.exit(0)
