@@ -168,44 +168,87 @@ class GPT(nn.Module):
         return optimizer
         
 # access the gpu
-device = "cpu"
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch import distributed as dist
+import os
+
+ddp = int(os.environ.get("RANK", -1)) != -1 # asks if we are running ddp
+if ddp:
+    assert torch.cuda.is_available() #"DDP requires CUDA"
+    init_process_group(backend="nccl")
+    ddp_rank = int(os.environ["RANK"]) # the global rank of the GPU we are using
+    ddp_local_rank = int(os.environ["LOCAL_RANK"]) # the local rank of the GPU we are using (of the node)
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device =  f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0
+    
+else:
+    # if not ddp, we are running on a single GPU or CPU
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # and then we can initialize a single GPU or CPU as before
+
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    print("using "+device)
+    
+torch.manual_seed(1337)
+
 if torch.cuda.is_available():
-    device = "cuda"
-print("using "+device)
+    torch.cuda.manual_seed_all(1337)
+    
+total_batch_size = 524288 # 2^19 ~500k tokens per batch, as used in the GPT-2 paper
+B = 4
+T = 1024
+assert total_batch_size % (B*T*ddp_world_size) == 0
+gradient_accumulation_steps = total_batch_size // (B*T) # if on ddp, this also divides by the number of gpus
+if master_process:
+    print(f"running with {ddp_world_size} processes")
+    print(f"batch size {B}, context size {T}, gradient accumulation steps {gradient_accumulation_steps}, total batch size {B*T*gradient_accumulation_steps}")
 
 import tiktoken
 
 # loads data from Tiny Shakespeare dataset
-class DataLoaderLite: 
-    def __init__(self, B, T):
+class DataLoaderLite:
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B # batch size
         self.T = T # context window size
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        
         with open("input.txt", "r", encoding = "utf-8") as f:  
             text = f.read()
         enc = tiktoken.get_encoding("gpt2") # gets the GPT-2 BPE tokenizer
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens, dtype = torch.long)
         print(f"loaded {self.tokens.size(0)} tokens")
-        print("1 epoch = "+str(self.tokens.size(0)//(B*T))+" batches")
-    
-        self.current_position = 0
+        
+        self.current_position = self.process_rank * self.B * self.T # each process starts at a different part of the data
     
     def next_batch(self):
-        chunk = self.tokens[self.current_position:self.current_position + self.B * self.T + 1]
-        x = chunk[:-1].view(self.B, self.T) # input is all but last token
-        y = chunk[1:].view(self.B, self.T)  # target is the next token for all tokens in x
+        B, T = self.B, self.T
+        chunk = self.tokens[self.current_position: self.current_position + B * T + 1]
+        x = chunk[:-1].view(B, T) # input is all but last token
+        y = chunk[1:].view(B, T)  # target is the next token
         
-        self.current_position += self.B * self.T # move forward in the data by B*T tokens
-        
-        if self.current_position + (self.B * self.T + 1) >= self.tokens.size(0):
-            self.current_position = 0 # if we reach the end of the data, start over
-        return x, y
+        self.current_position += self.num_processes * B * T # move forward in the data by num_processes * B * T tokens
+        if self.current_position + (B * T * self.num_processes + 1) >= len(self.tokens):
+            self.current_position = self.process_rank * B * T # if we reach the end of the data, start over
     
-    
+
 # can alternatively load Hugging Face weights for GPT-2 from the transformers library
 model = GPT(GPTConfig(vocab_size = 50304)) # nicely divisble by powers of 2 which quickens the run time on GPU kernels
 model.to(device)
 # model = torch.compile(model) # should be used for faster training in PyTorch 2.0 but my GPU is too old
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+
+raw_model = model.module if ddp else model # unwrap DDP model for logging if needed
 
 # implements the learning rate schedule from the GPT-2 paper
 max_lr = 6e-4
@@ -225,7 +268,9 @@ def get_lr(it):
 
 
 
-train_loader = DataLoaderLite(B=8, T=64) # should be B = 8, T = 1024, but my GPU is too small
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+
 
 
 # sets the matmul from FP32 to TF32 for faster training on modern GPUs (i dont have one so i cant test it)
@@ -235,18 +280,33 @@ train_loader = DataLoaderLite(B=8, T=64) # should be B = 8, T = 1024, but my GPU
 # bugfixed AdamW optimizer from PyTorch
 optimizer = model.configure_optimizer(weight_decay=1e-1, learning_rate=max_lr, device=device)
 # sets to training mode
-model.train()
-for i in range(50):
-    # loads a batch from the dataset
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
+for i in range(50): # arbitrary number of iterations
+    # validation loss
+    
+    
+    
+    # training step
+    model.train()
     optimizer.zero_grad()
-    #with torch.autocast(device_type=device, dtype=torch.bfloat16): # reduces the precision of certain matmuls and convolutions to BF16 from FP32 for faster training on modern GPUs (i dont have one so i cant test it)
-    logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(gradient_accumulation_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+        #with torch.autocast(device_type=device, dtype=torch.bfloat16): # reduces the precision of certain matmuls and convolutions to BF16 from FP32 for faster training on modern GPUs (i dont have one so i cant test it)
+        logits, loss = model(x, y)
+        loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+        loss_accum += loss.detach()
+        loss.backward() # scale the loss to account for gradient accumulation
+        if ddp:
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) # average the loss across all processes for logging
+    lr = get_lr(micro_step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # gradient clipping at 1.0 to prevent gradient explosions
     optimizer.step()
-    print(f"step {i} | loss {loss.item()} | norm {norm:.4f}")
+    print(f"step {i} | loss {loss_accum.item()} | norm {norm:.4f}")
 
 
 import sys; sys.exit(0)
@@ -270,4 +330,3 @@ for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
     print(">" + decoded)
-    
