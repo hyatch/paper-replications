@@ -1,4 +1,4 @@
-This implementation of GPT2 follows the 124M model and is guided by Andrej Karpathy's recreation. It serves as a exploration of the outstanding architecture and features of GPT-2 rather than a strict replication.
+This implementation of GPT2 follows the 124M model and is guided by Andrej Karpathy's recreation. It serves as a exploration of the outstanding architecture and features of GPT-2 rather than a strict replication or a useful generation.
 
 My in-computer GPU is a NVIDIA GeForce MX330 which lacks many of the modern Pytorch runtime accelerations including torch.compile, Tensor Cores, and DistributedDataParallel. 
 
