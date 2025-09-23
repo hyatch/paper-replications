@@ -1,0 +1,1 @@
+This is a replication of the landmark DeepSeek-V2 model that employed Multi-Latent Attention as a solution to KV caching in LLMs. This paper was able to drastically decrease the memory needed at inference time with a clever utilization and reusing of the latent space. 
