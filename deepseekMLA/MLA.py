@@ -80,7 +80,6 @@ class Head(nn.Module):
         self.v_proj = nn.Linear(n_embd, head_size, bias = False) 
                 
         self.dropout = nn.Dropout(dropout)
-        self.register_buffer('causal_mask', torch.tril(torch.ones(block_size, block_size, dtype = torch.bool)))
         
     def forward(self, x, cached = None, start_pos = 0):
         B,T,C = x.shape 
@@ -88,7 +87,7 @@ class Head(nn.Module):
         c_q = self.q_compress(x)
         c_kv = self.kv_compress(x)
         
-        q_c = self.q_content_proj(c_q) # (B, nh, T, hs)
+        q_c = self.q_content_proj(c_q) 
         q_prer = self.q_rotary_proj(c_q)
         q_r = self.rope(q_prer, start_pos = start_pos)
         q = torch.cat((q_c, q_r), dim = -1)
@@ -244,7 +243,6 @@ class Transformer(nn.Module):
         kv_cache = [None] * len(self.blocks)  # initialize kv cache for each block
         current_pos = idx.size(1)
         for _ in range(max_new_tokens):
-            # crops idx to the last block_size tokens
             idx_cond = idx[:, -1:]
             logits, loss, kv_cache = self(idx_cond, kv_cache = kv_cache, start_pos = current_pos-1)  # calls the forward function to get logits
             logits = logits[:, -1, :] # accesses the last character in the context (B,C)
