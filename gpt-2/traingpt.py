@@ -201,7 +201,9 @@ torch.manual_seed(1337)
 
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(1337)
-    
+
+enc = tiktoken.get_encoding("gpt2")
+
 total_batch_size = 524288 # 2^19 ~500k tokens per batch, as used in the GPT-2 paper
 B = 4
 T = 1024
@@ -280,11 +282,44 @@ val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_w
 # bugfixed AdamW optimizer from PyTorch
 optimizer = model.configure_optimizer(weight_decay=1e-1, learning_rate=max_lr, device=device)
 # sets to training mode
-for i in range(50): # arbitrary number of iterations
+for i in range(10000): # would be 19703 for GPT-2 paper
     # validation loss
+    if i % 100 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+            if ddp:
+                dist.all_reduce(loss, op=dist.ReduceOp.AVG) # average the loss across all processes for logging
+            if master_process:
+                print(f"step {i} | val loss {val_loss_accum.item()}")
     
-    
-    
+    # generation
+    if i > 0 and i % 100 == 0:
+        model.eval()
+        num_return_seq = 4
+        max_length = 32
+        tokens = enc.encode("Hi, I'm an AI model, and")
+        tokens = torch.tensor(tokens, dtype = torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_seq, 1)
+        tokens = tokens.to(device)
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42 + ddp_rank) # different seed per process for more diverse samples
+        while xgen.size(1) < max_length:
+            with torch.no_grad():
+                logits, loss = model(xgen)
+                logits = logits[:, -1, :] # focus only on the last time step
+                probs = F.softmax(logits, dim=-1) # convert to probabilities
+                xnext = torch.multinomial(probs, num_samples=1, generator=sample_rng) # sample
+                xgen = torch.cat((xgen, xnext), dim=1) # append to the sequence and continue
+
     # training step
     model.train()
     optimizer.zero_grad()
@@ -308,25 +343,5 @@ for i in range(50): # arbitrary number of iterations
     optimizer.step()
     print(f"step {i} | loss {loss_accum.item()} | norm {norm:.4f}")
 
-
-import sys; sys.exit(0)
-
-# set to eval mode for inference
-model.eval()
-max_length = 30
-num_return_sequences = 5
-
-while x.size(1) < max_length:
-    with torch.no_grad():
-        logits = model(x)
-        logits = logits[:, -1, :]
-        probs = F.softmax(logits, dim = -1)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim = -1)
-        ix = torch.multinomial(topk_probs, 1)
-        xcol = torch.gather(topk_indices, -1, ix)
-        x = torch.cat((x, xcol), dim = 1)
-
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">" + decoded)
+if ddp:
+    destroy_process_group()
